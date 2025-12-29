@@ -1,6 +1,18 @@
 /*
  * TaaS Node - Userspace PTP Daemon
  * SPDX-License-Identifier: GPL-2.0
+ *
+ * TaaS User-Space Time Node
+ *
+ * This process maps the BCM2837 system timer directly and serves
+ * raw hardware timestamps over UDP.
+ *
+ * Design constraints:
+ * - No dynamic allocation after init
+ * - No libc time functions
+ * - Deterministic execution path
+ *
+ * This is a validation and deployment node, not a full PTP stack.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -21,7 +33,12 @@
 static int timer_fd = -1;
 static void *map_base = NULL;
 
-/* Async-signal-safe cleanup handler */
+/*
+ * shutdown_node - async-signal-safe cleanup handler
+ *
+ * Only async-signal-safe functions are used here.
+ * No heap allocation or stdio calls are performed.
+ */
 void shutdown_node(int sig)
 {
     if (map_base != MAP_FAILED && map_base != NULL) 
@@ -35,6 +52,7 @@ void shutdown_node(int sig)
     _exit(EXIT_SUCCESS);
 }
 
+
 int main(void)
 {
     struct sched_param sp = { .sched_priority = 99 };
@@ -42,24 +60,36 @@ int main(void)
     volatile uint32_t *st_low, *st_high;
     int sockfd;
 
-    /* 1. Setup Signals */
     signal(SIGINT, shutdown_node);
     signal(SIGTERM, shutdown_node);
 
-    /* 2. Real-Time & Memory Locking */
+    /*
+     * Lock all current and future pages to avoid page faults
+     * during real-time execution.
+     */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0)
         perror("taas: warning: mlockall failed");
 
+    /*
+     * Elevate process to real-time FIFO scheduling.
+     * Failure is logged but not fatal.
+     */
     if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0)
         perror("taas: warning: sched_setscheduler failed");
 
-    /* 3. Hardware Access (MMIO) */
+    /*
+     * Open the timer device for MMIO mapping.
+     */
     timer_fd = open(TIMER_DEVICE, O_RDWR | O_SYNC);
     if (timer_fd < 0) {
         perror("taas: open timer device");
         return EXIT_FAILURE;
     }
 
+    /*
+     * Map the timer registers into user space.
+     * MAP_SHARED ensures visibility of hardware updates.
+     */
     map_base = mmap(NULL, MAP_SIZE, PROT_READ, MAP_SHARED, timer_fd, 0);
     if (map_base == MAP_FAILED) {
         perror("taas: mmap failed");
@@ -71,7 +101,6 @@ int main(void)
     st_low  = (volatile uint32_t *)((char *)map_base + 0x04);
     st_high = (volatile uint32_t *)((char *)map_base + 0x08);
 
-    /* 4. Network Setup */
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("taas: socket creation");
@@ -89,12 +118,17 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    /* 5. Event Loop (Zero-Copy Read) */
     uint32_t trigger;
     uint32_t h1, h2, l;
     uint64_t ts;
     socklen_t len = sizeof(cliaddr);
 
+    /*
+     * Main event loop:
+     * - Wait for UDP trigger
+     * - Perform atomic 64-bit timer read
+     * - Send raw timestamp back
+     */
     while (1) {
         if (recvfrom(sockfd, &trigger, sizeof(trigger), 0, 
                     (struct sockaddr *)&cliaddr, &len) > 0) {
