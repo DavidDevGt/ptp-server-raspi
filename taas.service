@@ -15,5 +15,8 @@ CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=99
 LimitMEMLOCK=infinity
 
+CPUAffinity=3
+AllowedCPUs=3
+
 [Install]
 WantedBy=multi-user.target
