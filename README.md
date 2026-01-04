@@ -1,3 +1,5 @@
+# TaaS — Time as a Service
+
 ![platform](https://img.shields.io/badge/platform-Raspberry%20Pi%20Zero%202%20W-red)
 ![kernel](https://img.shields.io/badge/kernel-6.12.x--v7-green)
 ![license](https://img.shields.io/badge/license-GPLv2-blue)
@@ -5,44 +7,39 @@
 ![memory](https://img.shields.io/badge/memory-mlockall-orange)
 ![crypto](https://img.shields.io/badge/crypto-Ed25519-blue)
 
-# TaaS — Time as a Service
-
-**Deterministic hardware time access and PTP node for Raspberry Pi (BCM2837)**
+**Deterministic hardware time access and PTP node for Raspberry Pi (BCM2837).**
 
 ---
 
 ## Overview
 
-**TaaS (Time as a Service)** is a low-level timing architecture focused on **deterministic, low-latency time access** on Linux-based embedded systems.
+**TaaS (Time as a Service)** is a low-level timing architecture designed for **deterministic, low-latency time access** on Linux-based embedded systems.
 
-Instead of relying on syscall-based clocks (`clock_gettime`, hrtimers, vDSO), TaaS exposes the **BCM2837 64-bit System Timer** directly to user space via a minimal kernel driver and an `mmap()`-based MMIO interface.
+By bypassing standard syscall-based clocks (`clock_gettime`, hrtimers, vDSO), TaaS exposes the **BCM2837 64-bit System Timer** directly to user space via a minimal kernel driver and an `mmap()`-based MMIO interface.
 
-The goal is not abstraction — the goal is **predictability**.
+The ultimate objective is not abstraction, but **predictability**.
 
-This project exists because:
-* Scheduler latency exists
-* Syscalls are not free
-* Time-sensitive systems should read time, not ask for it
+This project addresses key real-time challenges:
+* **Scheduler latency:** Traditional time-keeping is subject to OS scheduling.
+* **Syscall overhead:** Context switches are not free.
+* **Direct Access:** Time-critical systems should read time directly from hardware, not request it from the kernel.
 
 ---
 
 ## Design Goals
 
-* Deterministic reads (no scheduler involvement)
-* Zero-copy MMIO access
-* No timekeeping reinvention
-* Minimal kernel surface area
-* Clear failure modes
-* No background threads in kernel space
+* **Deterministic Reads:** Zero scheduler involvement during the hot path.
+* **Zero-Copy MMIO:** Direct register access via memory mapping.
+* **Minimal Footprint:** No unnecessary kernel surface area or timekeeping reinvention.
+* **Predictable Execution:** Clear failure modes and no background kernel threads.
 
-If you need portability or POSIX compliance, this is not for you.
+*Note: If your use case requires portability or POSIX compliance, this architecture is not the intended solution.*
 
 ---
 
 ## System Architecture
 
-TaaS maps the hardware timer directly into user space.
-The kernel is used only to **validate, map and protect access**.
+TaaS maps the hardware timer directly into user space. The kernel's role is strictly limited to **validation, mapping, and protecting hardware access.**
 
 ```text
 ┌──────────────────────────────┐
@@ -64,115 +61,85 @@ The kernel is used only to **validate, map and protect access**.
 │  - UDP time responder        │
 │  - Ed25519 Signing Engine    │ 
 └──────────────────────────────┘
-
 ```
 
-No kernel threads.
-No ioctl spam.
-No polling inside the kernel.
+**Efficiency by design:** No kernel threads, no ioctl overhead, and zero polling inside kernel space.
 
 ---
 
 ## Kernel Driver (`taas_driver.c`)
 
-The kernel module performs **three tasks only**:
+The kernel module is a lightweight LKM that performs exactly **three tasks**:
 
-1. Maps the System Timer registers using MMIO
-2. Ensures non-cached access (`pgprot_noncached`)
-3. Exposes a read-only memory region via `mmap()`
+1. Maps the System Timer registers using MMIO.
+2. Ensures strictly non-cached access (`pgprot_noncached`) to avoid stale data.
+3. Exposes a read-only memory region via the `mmap()` interface.
 
 ### Atomicity
-
-BCM2837 exposes the timer via two 32-bit registers.
-The driver implements a verification loop to guarantee a **consistent 64-bit read** without locks.
-
-No spinlocks.
-No IRQ hooks.
-No scheduler interaction.
+Since the BCM2837 exposes the 64-bit timer via two 32-bit registers (Low/High), the driver implements a lock-less verification loop to guarantee a **consistent 64-bit read** without the overhead of spinlocks or IRQ hooks.
 
 ---
 
 ## User Space Node (`taas_node.c`)
 
-The user-space daemon is intentionally simple and written in plain C.
+The user-space daemon is a high-performance C implementation focused on determinism.
 
-Key properties:
-
-* Runs under `SCHED_FIFO` priority 99
-* Memory fully locked using `mlockall()`
-* No dynamic allocation after init (Zero-Alloc Hot-Path)
-* No libc time functions
-* Reads hardware time directly from mapped memory
-* **Integrated Ed25519 TSA:** Provides signed "Proof of Existence" certificates.
-
-The process does not *request* time — it **loads it**.
+**Key Properties:**
+* **Real-time Priority:** Runs under `SCHED_FIFO` (priority 99).
+* **Memory Residency:** Pages are locked using `mlockall()` to prevent swapping and page faults.
+* **Zero-Alloc Hot-Path:** No dynamic memory allocation after initialization.
+* **Hardware Native:** Reads time directly from the mapped registers, bypassing libc time functions.
+* **Integrated Ed25519 TSA:** Provides signed "Proof of Existence" certificates for cryptographic notarization.
 
 ---
 
 ## Installation
 
 ### Requirements
-
-* Raspberry Pi Zero 2 W
-(RPi 3 supported with adjusted MMIO offsets)
-* Raspberry Pi OS (Debian 13 / newer)
-* Kernel headers
-* OpenSSL Libs (`libssl-dev`)
+* **Hardware:** Raspberry Pi Zero 2 W (BCM2837).
+* **OS:** Raspberry Pi OS (Debian 13 or newer).
+* **Dependencies:** Kernel headers and OpenSSL development libraries (`libssl-dev`).
 
 ```bash
 sudo apt install raspberrypi-kernel-headers libssl-dev
-
 ```
 
 ### Setup
 
-1. **Generate Identity (Node Keys):**
-
+1. **Generate Node Identity (Ed25519):**
 ```bash
 openssl genpkey -algorithm ed25519 -out private_key.pem
-
 ```
 
-2. **Deploy:**
-
+2. **Deploy System:**
 ```bash
 chmod +x setup_taas.sh
 sudo ./setup_taas.sh
-
 ```
 
-To ensure deterministic behavior and avoid scheduler interference, the Raspberry Pi **must** be configured with CPU isolation and tickless operation.
-
-Edit `/boot/cmdline.txt` and append (single line, space-separated):
+### Real-time Tuning
+To ensure maximum predictability, it is highly recommended to isolate the CPU core. Append the following to `/boot/cmdline.txt`:
 
 ```text
 isolcpus=3 rcu_nocbs=3 nohz_full=3
-
 ```
-
-This dedicates **CPU core 3** exclusively to the TaaS user-space node.
+*This dedicates Core 3 exclusively to the TaaS node by removing scheduler ticks and RCU callbacks.*
 
 ---
 
 ## Validation & Usage
 
 ### 1. Basic UDP Timer (Raw PTP)
-
+Query the node for the raw 64-bit hardware timer value:
 ```bash
 echo -n "ping" | nc -u -w 1 127.0.0.1 1588 | hexdump -C
-
 ```
 
-The returned value is the **raw System Timer value** (8 bytes).
-
 ### 2. Trusted Timestamping (TSA Certificate)
-
-Send a 32-byte SHA256 hash to receive a 104-byte signed certificate:
-
+Send a 32-byte SHA256 hash to receive a signed 104-byte notarization certificate:
 ```bash
-# Example: notarizing a file
-sha256sum hola.txt | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 127.0.0.1 1588 > cert.tsr
-
+# Example: Notarizing a file
+sha256sum document.txt | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 127.0.0.1 1588 > cert.tsr
 ```
 
 ---
@@ -185,32 +152,33 @@ sha256sum hola.txt | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 127.0.0.1 1588 > cer
 | SoC | BCM2837 ✅ |
 | Architecture | armv7l (32-bit) ✅ |
 | Kernel | Linux 6.12.x-rpi-v7 ✅ |
-| Time Source | System Timer (µs) ✅ |
-| Crypto | Ed25519 Signature ✅ |
+| Time Source | System Timer (µs resolution) ✅ |
+| Crypto | Ed25519 Digital Signature ✅ |
 
 ---
 
 ## Limitations
 
-* Not portable
-* Tied to BCM2837 memory layout
-* Not synchronized by default
-* No clock discipline logic
-* No leap second handling
+* **Hardware Locked:** Non-portable; tied to BCM2837 memory layout (Physical `0x3F003000`).
+* **Raw Time:** No clock discipline (NTP-style slewing) or leap second handling.
+* **Manual Sync:** Not synchronized with external time sources by default.
 
-This is intentional.
+*These limitations are intentional design choices to prioritize performance over general-purpose flexibility.*
 
 ---
 
 ## License
 
-GPLv2
-Kernel code follows Linux kernel licensing conventions.
+**GPLv2**
+Kernel-side code adheres to Linux kernel licensing conventions.
 
 ---
 
 ## Philosophy
 
-> In real-time systems, abstraction is latency.
-> The kernel should protect access — not stand in the way.
+> In real-time systems, **abstraction is latency**. 
+> The kernel should protect hardware access — not stand in its way.
 
+---
+
+**Author:** David ([@DavidDevGt](https://github.com/DavidDevGt))
