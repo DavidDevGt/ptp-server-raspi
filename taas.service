@@ -1,12 +1,12 @@
 [Unit]
 Description=Hardware-Level Time-as-a-Service Node
-After=network-online.target
-Wants=network-online.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
-ExecStart=/home/raspi/ptp_server/taas_node
-WorkingDirectory=/home/raspi/ptp_server
+ExecStart=/home/raspi/taas/taas_node
+WorkingDirectory=/home/raspi/taas
 Restart=always
 RestartSec=3
 User=root
