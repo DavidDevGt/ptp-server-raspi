@@ -100,7 +100,7 @@ sha256sum document.pdf | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 [NODE_IP] 1588 >
 ---
 
 ## License
-**GPLv2** | Professional systems engineering by David Vargas.
+**GPLv2**
 
 ---
 
