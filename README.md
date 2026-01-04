@@ -2,182 +2,110 @@
 
 ![platform](https://img.shields.io/badge/platform-Raspberry%20Pi%20Zero%202%20W-red)
 ![kernel](https://img.shields.io/badge/kernel-6.12.x--v7-green)
-![license](https://img.shields.io/badge/license-GPLv2-blue)
 ![realtime](https://img.shields.io/badge/realtime-SCHED_FIFO_99-critical)
-![memory](https://img.shields.io/badge/memory-mlockall-orange)
-![crypto](https://img.shields.io/badge/crypto-Ed25519-blue)
+![isolation](https://img.shields.io/badge/isolation-isolcpus--3-orange)
+![network](https://img.shields.io/badge/network-Low--Latency--WiFi-blue)
+![deployment](https://img.shields.io/badge/deployment-GitOps--Hooks-brightgreen)
 
-**Deterministic hardware time access and PTP node for Raspberry Pi (BCM2837).**
+**Deterministic hardware time access, Cryptographic Notarization, and Low-Latency Networking for BCM2837.**
 
 ---
 
 ## Overview
 
-**TaaS (Time as a Service)** is a low-level timing architecture designed for **deterministic, low-latency time access** on Linux-based embedded systems.
+**TaaS (Time as a Service)** is a vertically optimized timing architecture designed to deliver **predictable, microsecond-accurate time** over a network. 
 
-By bypassing standard syscall-based clocks (`clock_gettime`, hrtimers, vDSO), TaaS exposes the **BCM2837 64-bit System Timer** directly to user space via a minimal kernel driver and an `mmap()`-based MMIO interface.
-
-The ultimate objective is not abstraction, but **predictability**.
-
-This project addresses key real-time challenges:
-* **Scheduler latency:** Traditional time-keeping is subject to OS scheduling.
-* **Syscall overhead:** Context switches are not free.
-* **Direct Access:** Time-critical systems should read time directly from hardware, not request it from the kernel.
+By bypassing standard kernel abstractions and tuning the hardware at the firmware level, TaaS creates a dedicated execution slice for time-critical operations. It exposes the **BCM2837 64-bit System Timer** directly to user space via a custom MMIO-based kernel driver, ensuring that the act of "reading time" is free from syscall overhead and scheduler interference.
 
 ---
 
-## Design Goals
+## Vertical System Optimization (The SRE Stack)
 
-* **Deterministic Reads:** Zero scheduler involvement during the hot path.
-* **Zero-Copy MMIO:** Direct register access via memory mapping.
-* **Minimal Footprint:** No unnecessary kernel surface area or timekeeping reinvention.
-* **Predictable Execution:** Clear failure modes and no background kernel threads.
+TaaS is not just code; it is a **hardened runtime environment**. The system is tuned from the bootloader to the application layer:
 
-*Note: If your use case requires portability or POSIX compliance, this architecture is not the intended solution.*
+### 1. Hard Core Isolation & Kernel Silence
+The OS is restricted to Cores 0-2, leaving **Core 3** as a dedicated silicon slice for TaaS. This is achieved via advanced boot parameters in `cmdline.txt`:
+*   `isolcpus=3 rcu_nocbs=3 nohz_full=3`: Completely removes Core 3 from the general scheduler.
+*   `irqaffinity=0,1,2`: Pins all hardware interrupts to other cores.
+*   `rcu_nocb_poll`: Offloads RCU processing to ensure zero kernel-induced jitter on the timing core.
+*   `workqueue.cpumask=7`: Restricts kernel worker threads to non-isolated cores.
+
+### 2. Radio & Network Layer Tuning
+To achieve low-latency over WiFi (WLAN), the radio power management is disabled to prevent "sleep-induced latency spikes":
+*   `iwconfig wlan0 power off`: Forces the WiFi chip into high-performance constant-awake mode.
+*   `cfg80211.ieee80211_regdom=GT`: Regulatory domain hardcoded for consistent radio behavior.
+
+### 3. Firmware & Thermal Stability
+*   `force_turbo=1`: Disables dynamic frequency scaling (DVFS) to prevent clock instability and timing drift.
+*   `arm_boost=1`: Maximizes throughput for cryptographic operations.
+*   `disable-bt`: Bluetooth is disabled at the overlay level to reduce interrupt load and radio interference.
+
+---
+
+## Infrastructure as Code (Embedded GitOps)
+
+TaaS utilizes a **Git-driven deployment workflow**. Infrastructure updates are managed via server-side Git hooks:
+*   **Post-Receive Automation**: Pushing code to the node triggers an automatic build, LKM installation, and network optimization.
+*   **Certification**: Every deployment ends with a real-time jitter certification test (`measure_jitter.py`) running under a real-time scheduler.
 
 ---
 
 ## System Architecture
 
-TaaS maps the hardware timer directly into user space. The kernel's role is strictly limited to **validation, mapping, and protecting hardware access.**
-
 ```text
-┌──────────────────────────────┐
-│      BCM2837 SoC Hardware    │
-│   64-bit System Timer (ST)   │
-└───────────────┬──────────────┘
-                │ MMIO
-┌───────────────▼──────────────┐
-│      Kernel Module (taas)    │
-│  - Non-cached page mapping   │
-│  - Atomic 64-bit read logic  │
-│  - miscdevice (/dev/taas)    │
-└───────────────┬──────────────┘
-                │ mmap()
-┌───────────────▼──────────────┐
-│       User Space Node        │
-│  - SCHED_FIFO (prio 99)      │
-│  - mlockall(MCL_CURRENT|FUT) │
-│  - UDP time responder        │
-│  - Ed25519 Signing Engine    │ 
-└──────────────────────────────┘
+    FIRMWARE / BOOT LAYER          KERNEL LAYER              USERSPACE LAYER
+┌──────────────────────────┐   ┌──────────────────┐      ┌──────────────────────┐
+│ BCM2837 SoC              │   │ Custom LKM       │      │ TaaS RT-Daemon       │
+│ - Core 3 Isolated        │   │ - Non-cached Pgs │ mmap │ - SCHED_FIFO 99      │
+│ - IRQ Affinity pinned    ├──►│ - Atomic Logic   ├─────►│ - mlockall Residency │
+│ - WiFi Power Mgmt: OFF   │   │ - /dev/taas_timer│      │ - Ed25519 Signer     │
+└──────────────────────────┘   └──────────────────┘      └──────────┬───────────┘
+                                                                    │
+                                              UDP [Port 1588] ◄─────┘
+                                              - Signed TSA Certificates
+                                              - Raw PTP-like timestamps
 ```
-
-**Efficiency by design:** No kernel threads, no ioctl overhead, and zero polling inside kernel space.
 
 ---
 
-## Kernel Driver (`taas_driver.c`)
+## Technical Deep-Dive: Atomicity
 
-The kernel module is a lightweight LKM that performs exactly **three tasks**:
+Reading a 64-bit timestamp on a 32-bit architecture (ARMv7) risks data corruption if a rollover occurs between reading the Low and High registers. TaaS implements a lock-less verification loop:
 
-1. Maps the System Timer registers using MMIO.
-2. Ensures strictly non-cached access (`pgprot_noncached`) to avoid stale data.
-3. Exposes a read-only memory region via the `mmap()` interface.
-
-### Atomicity
-Since the BCM2837 exposes the 64-bit timer via two 32-bit registers (Low/High), the driver implements a lock-less verification loop to guarantee a **consistent 64-bit read** without the overhead of spinlocks or IRQ hooks.
+```c
+/* Guaranteed consistent 64-bit read on 32-bit bus */
+do {
+    h1 = *st_high;
+    l  = *st_low;
+    h2 = *st_high;
+} while (h1 != h2);
+timestamp = ((u64)h1 << 32) | l;
+```
 
 ---
 
-## User Space Node (`taas_node.c`)
+## Usage
 
-The user-space daemon is a high-performance C implementation focused on determinism.
-
-**Key Properties:**
-* **Real-time Priority:** Runs under `SCHED_FIFO` (priority 99).
-* **Memory Residency:** Pages are locked using `mlockall()` to prevent swapping and page faults.
-* **Zero-Alloc Hot-Path:** No dynamic memory allocation after initialization.
-* **Hardware Native:** Reads time directly from the mapped registers, bypassing libc time functions.
-* **Integrated Ed25519 TSA:** Provides signed "Proof of Existence" certificates for cryptographic notarization.
-
----
-
-## Installation
-
-### Requirements
-* **Hardware:** Raspberry Pi Zero 2 W (BCM2837).
-* **OS:** Raspberry Pi OS (Debian 13 or newer).
-* **Dependencies:** Kernel headers and OpenSSL development libraries (`libssl-dev`).
-
-```bash
-sudo apt install raspberrypi-kernel-headers libssl-dev
-```
-
-### Setup
-
-1. **Generate Node Identity (Ed25519):**
-```bash
-openssl genpkey -algorithm ed25519 -out private_key.pem
-```
-
-2. **Deploy System:**
-```bash
-chmod +x setup_taas.sh
-sudo ./setup_taas.sh
-```
-
-### Real-time Tuning
-To ensure maximum predictability, it is highly recommended to isolate the CPU core. Append the following to `/boot/cmdline.txt`:
-
-```text
-isolcpus=3 rcu_nocbs=3 nohz_full=3
-```
-*This dedicates Core 3 exclusively to the TaaS node by removing scheduler ticks and RCU callbacks.*
-
----
-
-## Validation & Usage
-
-### 1. Basic UDP Timer (Raw PTP)
-Query the node for the raw 64-bit hardware timer value:
+### 1. Raw PTP-style Timestamp (UDP)
 ```bash
 echo -n "ping" | nc -u -w 1 127.0.0.1 1588 | hexdump -C
 ```
 
-### 2. Trusted Timestamping (TSA Certificate)
-Send a 32-byte SHA256 hash to receive a signed 104-byte notarization certificate:
+### 2. Trusted Timestamping (TSA Notarization)
+Send a 32-byte SHA256 hash to receive a signed 104-byte certificate:
 ```bash
-# Example: Notarizing a file
-sha256sum document.txt | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 127.0.0.1 1588 > cert.tsr
+sha256sum document.pdf | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 [NODE_IP] 1588 > cert.tsr
 ```
 
 ---
 
-## Compatibility Matrix
-
-| Component | Status |
-| --- | --- |
-| Hardware | Raspberry Pi Zero 2 W ✅ |
-| SoC | BCM2837 ✅ |
-| Architecture | armv7l (32-bit) ✅ |
-| Kernel | Linux 6.12.x-rpi-v7 ✅ |
-| Time Source | System Timer (µs resolution) ✅ |
-| Crypto | Ed25519 Digital Signature ✅ |
-
----
-
-## Limitations
-
-* **Hardware Locked:** Non-portable; tied to BCM2837 memory layout (Physical `0x3F003000`).
-* **Raw Time:** No clock discipline (NTP-style slewing) or leap second handling.
-* **Manual Sync:** Not synchronized with external time sources by default.
-
-*These limitations are intentional design choices to prioritize performance over general-purpose flexibility.*
-
----
-
 ## License
-
-**GPLv2**
-Kernel-side code adheres to Linux kernel licensing conventions.
+**GPLv2** | Professional systems engineering by David Vargas.
 
 ---
 
 ## Philosophy
-
-> In real-time systems, **abstraction is latency**. 
-> The kernel should protect hardware access — not stand in its way.
+> "In real-time systems, **abstraction is latency**. The kernel should protect hardware access — not stand in its way."
 
 ---
 
