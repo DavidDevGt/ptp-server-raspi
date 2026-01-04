@@ -3,6 +3,7 @@
 ![license](https://img.shields.io/badge/license-GPLv2-blue)
 ![realtime](https://img.shields.io/badge/realtime-SCHED_FIFO_99-critical)
 ![memory](https://img.shields.io/badge/memory-mlockall-orange)
+![crypto](https://img.shields.io/badge/crypto-Ed25519-blue)
 
 # TaaS — Time as a Service (Enterprise Edition)
 
@@ -40,13 +41,13 @@ If you need portability or POSIX compliance, this is not for you.
 
 ## System Architecture
 
-TaaS maps the hardware timer directly into user space.  
+TaaS maps the hardware timer directly into user space.
 The kernel is used only to **validate, map and protect access**.
 
 ```text
 ┌──────────────────────────────┐
-│     BCM2837 SoC Hardware     │
-│  64-bit System Timer (ST)    │
+│      BCM2837 SoC Hardware    │
+│   64-bit System Timer (ST)   │
 └───────────────┬──────────────┘
                 │ MMIO
 ┌───────────────▼──────────────┐
@@ -57,12 +58,14 @@ The kernel is used only to **validate, map and protect access**.
 └───────────────┬──────────────┘
                 │ mmap()
 ┌───────────────▼──────────────┐
-│        User Space Node       │
+│       User Space Node        │
 │  - SCHED_FIFO (prio 99)      │
 │  - mlockall(MCL_CURRENT|FUT) │
 │  - UDP time responder        │
+│  - Ed25519 Signing Engine    │ <── Added: Trusted Timestamping
 └──────────────────────────────┘
-````
+
+```
 
 No kernel threads.
 No ioctl spam.
@@ -97,9 +100,10 @@ Key properties:
 
 * Runs under `SCHED_FIFO` priority 99
 * Memory fully locked using `mlockall()`
-* No dynamic allocation after init
+* No dynamic allocation after init (Zero-Alloc Hot-Path)
 * No libc time functions
 * Reads hardware time directly from mapped memory
+* **Integrated Ed25519 TSA:** Provides signed "Proof of Existence" certificates.
 
 The process does not *request* time — it **loads it**.
 
@@ -110,19 +114,31 @@ The process does not *request* time — it **loads it**.
 ### Requirements
 
 * Raspberry Pi Zero 2 W
-  (RPi 3/4 supported with adjusted MMIO offsets)
+(RPi 3/4 supported with adjusted MMIO offsets)
 * Raspberry Pi OS (Debian 13 / newer)
 * Kernel headers
+* OpenSSL Libs (`libssl-dev`)
 
 ```bash
-sudo apt install raspberrypi-kernel-headers
+sudo apt install raspberrypi-kernel-headers libssl-dev
+
 ```
 
 ### Setup
 
+1. **Generate Identity (Node Keys):**
+
+```bash
+openssl genpkey -algorithm ed25519 -out private_key.pem
+
+```
+
+2. **Deploy:**
+
 ```bash
 chmod +x setup_taas.sh
 sudo ./setup_taas.sh
+
 ```
 
 To ensure deterministic behavior and avoid scheduler interference, the Raspberry Pi **must** be configured with CPU isolation and tickless operation.
@@ -131,52 +147,46 @@ Edit `/boot/cmdline.txt` and append (single line, space-separated):
 
 ```text
 isolcpus=3 rcu_nocbs=3 nohz_full=3
+
 ```
 
 This dedicates **CPU core 3** exclusively to the TaaS user-space node.
 
-The script:
+---
 
-* Builds the kernel module
-* Loads it via `modprobe`
-* Installs udev rules
-* Registers a systemd service
+## Validation & Usage
 
-No manual intervention required after reboot.
+### 1. Basic UDP Timer (Raw PTP)
+
+```bash
+echo -n "ping" | nc -u -w 1 127.0.0.1 1588 | hexdump -C
+
+```
+
+The returned value is the **raw System Timer value** (8 bytes).
+
+### 2. Trusted Timestamping (TSA Certificate)
+
+Send a 32-byte SHA256 hash to receive a 104-byte signed certificate:
+
+```bash
+# Example: notarizing a file
+sha256sum hola.txt | cut -d' ' -f1 | xxd -r -p | nc -u -w 1 127.0.0.1 1588 > cert.tsr
+
+```
 
 ---
 
 ## Compatibility Matrix
 
-| Component    | Status                  |
-| ------------ | ----------------------- |
-| Hardware     | Raspberry Pi Zero 2 W ✅ |
-| SoC          | BCM2837 ✅               |
-| Architecture | armv7l (32-bit) ✅       |
-| Kernel       | Linux 6.12.x-rpi-v7 ✅   |
-| Time Source  | System Timer (µs) ✅     |
-
----
-
-## Validation
-
-Basic UDP sanity check:
-
-```bash
-echo -n "ping" | nc -u -w 1 127.0.0.1 1588 | hexdump -C
-```
-
-Example output:
-
-```hexdump
-00000000  0c a5 12 41 1e 00 00 00  |...A....|
-```
-
-The returned value is the **raw System Timer value**, little-endian, in microseconds.
-
-No conversion.
-No scaling.
-No correction.
+| Component | Status |
+| --- | --- |
+| Hardware | Raspberry Pi Zero 2 W ✅ |
+| SoC | BCM2837 ✅ |
+| Architecture | armv7l (32-bit) ✅ |
+| Kernel | Linux 6.12.x-rpi-v7 ✅ |
+| Time Source | System Timer (µs) ✅ |
+| Crypto | Ed25519 Signature ✅ |
 
 ---
 
